@@ -63,7 +63,9 @@ impl RequestStats {
             let tx = conn.transaction()?;
             // 先删命中的正文（明细删完就再也找不到要陪葬的正文 id 了）
             sql::delete_raw_matching(&tx, &plan)?;
-            sql::delete_matching(&tx, &plan)
+            let removed = sql::delete_matching(&tx, &plan)?;
+            tx.commit()?;
+            Ok(removed)
         })
         .unwrap_or(0)
     }
@@ -140,8 +142,53 @@ impl RequestStats {
         file_size(&file) + file_size(&PathBuf::from(format!("{}-wal", file.to_string_lossy())))
     }
 
-    /// 压缩数据库：先 `PRAGMA wal_checkpoint(TRUNCATE)` 把 WAL 并回主库并截零，
-    /// 再 `VACUUM` 重建整库文件回收空闲页。**后台线程**执行，返回启动结果。
+    /// 执行原始正文的**总容量上限**（`record::MAX_RAW_BYTES`）：超限时按
+    /// 「从旧到新」删到上限内，返回删除的行数（有删除才打日志）。
+    ///
+    /// 由周期清扫任务调用而不放进记账热路径：`SUM(size)` 在大表上是
+    /// 180 ms 量级的开销（见 `sql::sum_raw_bytes` 的说明），摊销到 5 分钟
+    /// 一次则可以忽略。删掉的正文只影响「详情」弹窗的历史报文，明细统计
+    /// 与聚合不受影响。
+    pub fn enforce_raw_size_cap(&self) -> usize {
+        let trimmed = self.with_conn_mut(&self.guard(), |conn| {
+            let total = sql::sum_raw_bytes(conn)?;
+            if total <= super::record::MAX_RAW_BYTES {
+                return Ok(0);
+            }
+            sql::trim_raw_bytes(conn, super::record::MAX_RAW_BYTES)
+        });
+        let trimmed = trimmed.unwrap_or(0);
+        if trimmed > 0 {
+            logging::log(
+                "[Stats]",
+                &format!(
+                    "原始正文总量超过 {}MB 上限，已清理 {trimmed} 条最旧报文（明细统计保留）",
+                    super::record::MAX_RAW_BYTES / (1024 * 1024)
+                ),
+            );
+        }
+        trimmed
+    }
+
+    /// 压缩数据库：`checkpoint(TRUNCATE)` → `VACUUM` → 再 `checkpoint(TRUNCATE)`
+    /// —— 首尾两次 checkpoint 缺一不可（理由见下），中间那次 VACUUM 重建整库
+    /// 文件回收空闲页。**后台线程**执行，返回启动结果。
+    ///
+    /// ── 为什么 VACUUM 之后还要再 checkpoint 一次（issue #297）────
+    /// WAL 模式下 `VACUUM` 是**一个原子事务**，而自动 checkpoint 只在事务
+    /// **之间**触发 —— 撑不住它的体量。于是重建后的整库会被原样写进 `-wal`，
+    /// VACUUM 收尾那次被动 checkpoint 把内容并回主库却**不截断 WAL 文件**：
+    /// 主库确实缩了，`-wal` 里却留着与整库等大的一份已分配空间。
+    ///
+    /// 只做首尾两次中的前一次（本函数在 #297 之前的形态）会稳定复现该 issue：
+    /// 实测「主库 126MB + WAL 0MB」的库走一遍变成「110MB + 111MB」，总占用
+    /// 从 126MB 涨到 221MB（1.76 倍）—— 与 #297 报的 624MB → 1.09GB（1.747 倍）
+    /// 同一形态。补上尾部 checkpoint 后同一个库变成「110MB + 0MB」，真正下降。
+    ///
+    /// 触发条件是「首参之前 `-wal` 已经被截零」（= 刚重启过、或上次压缩收过尾）：
+    /// 那时起点没有可回收的 WAL 余量，用户看到的就只剩「涨上去的那部分」。
+    /// 若起点 WAL 本身是肥的（跑了一阵没重启），首参先把它收回主库，账面仍是
+    /// 下降 —— 这正是同一个 bug 被一部分用户报成「正常变小」的原因。
     ///
     /// ── 为什么必须拿那把连接锁 ──────────────────────────────────
     /// 本项目存储层是「同步 rusqlite 单连接 + `Mutex`」：VACUUM 不允许在事务
@@ -171,6 +218,9 @@ impl RequestStats {
             let outcome = db.with(|conn| -> rusqlite::Result<()> {
                 conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
                 conn.execute_batch("VACUUM;")?;
+                // 尾部 checkpoint：把 VACUUM 写进 WAL 的那份整库并回主库并截零。
+                // 少了它，回收的空间只从主库搬到 `-wal`，总占用不降反升（#297）。
+                conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
                 Ok(())
             });
             let ok = matches!(outcome, Some(Ok(())));
@@ -178,7 +228,7 @@ impl RequestStats {
             // 状态会多卡一会儿；复位后的并发压缩请求与日志写入互不阻塞
             vacuum.mark_finished();
             if ok {
-                logging::log("[Stats]", "数据库压缩完成（checkpoint + VACUUM）");
+                logging::log("[Stats]", "数据库压缩完成（checkpoint + VACUUM + checkpoint）");
             } else {
                 logging::log("[Stats]", "⚠️ 数据库压缩未完成：数据库不可用或压缩失败");
             }

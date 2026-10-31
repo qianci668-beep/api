@@ -32,6 +32,7 @@ pub mod web_shim;
 use std::future::Future;
 use std::sync::OnceLock;
 
+use futures::FutureExt;
 use tokio::runtime::{Handle, Runtime};
 
 /// 惰性全局运行时：只承接「在非 Tokio 上下文里发起的后台任务」，
@@ -51,6 +52,26 @@ where
     }
 }
 
+/// Run a gateway task without allowing a panic to take down its Tokio worker.
+pub fn spawn_gateway_task<F>(future: F) -> tokio::task::JoinHandle<()>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    spawn_task(async move {
+        if std::panic::AssertUnwindSafe(future)
+            .catch_unwind()
+            .await
+            .is_err()
+        {
+            server::logging::console_line(
+                "[Panic]",
+                "后台任务异常，已终止该任务；网关继续运行，详见 logs/panic.log",
+            );
+        }
+    })
+}
+
 fn global_runtime() -> &'static Runtime {
     GLOBAL_RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
@@ -58,4 +79,15 @@ fn global_runtime() -> &'static Runtime {
             .build()
             .expect("创建后台 Tokio 运行时失败")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn background_panic_does_not_stop_other_tasks() {
+        let task = super::spawn_gateway_task(async { panic!("test task panic") });
+        assert!(task.await.is_ok());
+        let alive = super::spawn_gateway_task(async { 42 });
+        alive.await.unwrap();
+    }
 }

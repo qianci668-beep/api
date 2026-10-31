@@ -85,7 +85,7 @@ pub async fn run_now(State(state): State<ServerState>) -> Response {
         Value::Object(map) => {
             let mut merged = map;
             if let Value::Object(state_map) = state.auto_checkin().state() {
-                for (key, value) instate_map {
+                for (key, value) in state_map {
                     merged.insert(key, value);
                 }
             }

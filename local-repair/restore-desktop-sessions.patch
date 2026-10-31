@@ -1,0 +1,16 @@
+diff --git a/desktop-tauri/src-tauri/src/backend.rs b/desktop-tauri/src-tauri/src/backend.rs
+index 82b6b7a..3afb951 100644
+--- a/desktop-tauri/src-tauri/src/backend.rs
++++ b/desktop-tauri/src-tauri/src/backend.rs
+@@ -125,6 +125,11 @@ pub async fn ensure_ready(app: &AppHandle) -> Result<(), StartupFailure> {
+     // 面板访问控制的库句柄注入（桌面不注册管理员 → 该体系不启用，行为不变；
+     // 与容器共用数据目录且注册过时，桌面管理 API 需要 Key —— 壳自动携带）
+     server::access::attach_db(state.db().cloned());
++    // Restore the server-side session tables before the desktop reuses cached tokens.
++    // This is required even without a registered administrator: the desktop shell
++    // issues its own local management session, independently of model API keys.
++    server::access::load_refresh_tokens();
++    server::access::load_access_tokens();
+ 
+     // 管理界面（Tauri 窗口）跑在本机：OAuth 回调可以占本机登记端口，
+     // 判据与监听地址解耦 —— 开了局域网访问（0.0.0.0）后依然成立。

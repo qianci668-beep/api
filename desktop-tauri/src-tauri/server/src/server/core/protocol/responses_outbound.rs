@@ -658,7 +658,7 @@ impl ChatFromResponsesStream {
                     _ => return Vec::new(),
                 };
                 let key = tool_key(event, item);
-                ifself.has_arguments(&key) {
+                if self.has_arguments(&key) {
                     return Vec::new();
                 }
                 let mut out = self.start();
